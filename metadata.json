@@ -1,0 +1,6 @@
+{
+  "name": "JanDrishti — National Infrastructure Intelligence",
+  "description": "A scalable, multilingual AI Digital Public Good platform that transforms citizen development requests into explainable infrastructure priorities, demand hotspots, and policy recommendations across India.",
+  "requestFramePermissions": ["microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
