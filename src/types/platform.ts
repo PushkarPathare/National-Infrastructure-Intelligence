@@ -132,6 +132,20 @@ export interface StateIntelligence {
   svgPath: string;
 }
 
+export interface GeminiStructuredAnalysis {
+  language: string;
+  originalText: string;
+  normalizedIssue: string;
+  category: string;
+  subcategory: string;
+  location: string;
+  urgency: string;
+  summary: string;
+  infrastructureType: string;
+  confidence: string;
+  reasoning: string;
+}
+
 export interface CitizenRequestRecord {
   id: string;
   citizenText: string;
@@ -140,6 +154,11 @@ export interface CitizenRequestRecord {
   extractedIssue: string;
   category: InfrastructureCategory;
   subcategory: string;
+  infrastructureType?: string;
+  confidence?: string;
+  aiReasoning?: string;
+  analyzedByGemini?: boolean;
+  geminiAnalysis?: GeminiStructuredAnalysis;
   state: string;
   district: string;
   villageOrCity: string;

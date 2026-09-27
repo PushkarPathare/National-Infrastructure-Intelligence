@@ -39,6 +39,17 @@ export const SUPPORTED_LANGUAGES: {
     sampleCategory: 'Healthcare',
     scenarios: [
       {
+        label: 'Primary Healthcare Centre (Pune)',
+        category: 'Healthcare',
+        state: 'Maharashtra',
+        district: 'Pune District',
+        village: 'Ambegaon Rural Cluster',
+        text: 'Our village does not have a nearby primary healthcare centre.',
+        englishTranslation:
+          'Limited access to primary healthcare facilities in the village area.',
+        extractedIssue: 'Limited access to primary healthcare facilities',
+      },
+      {
         label: 'Rural Hospital Deficit (Pune)',
         category: 'Healthcare',
         state: 'Maharashtra',
@@ -1264,6 +1275,11 @@ export const INITIAL_CITIZEN_REQUESTS: CitizenRequestRecord[] = [
     extractedIssue: 'Lack of nearby healthcare facility',
     category: 'Healthcare',
     subcategory: 'Primary & Community Healthcare Centre (PHC/CHC)',
+    infrastructureType: 'Primary Healthcare',
+    confidence: '0.94',
+    aiReasoning:
+      'Semantic interpretation identifies a critical primary healthcare access deficit (>20 km travel distance) in rural Pune District, matching 387 clustered community submissions.',
+    analyzedByGemini: true,
     state: 'Maharashtra',
     district: 'Pune District',
     villageOrCity: 'Ambegaon / Manchar Rural Cluster',
@@ -1332,6 +1348,11 @@ export const INITIAL_CITIZEN_REQUESTS: CitizenRequestRecord[] = [
     extractedIssue: 'Absence of 24x7 emergency medical facility in rural block',
     category: 'Healthcare',
     subcategory: '24x7 Emergency & Maternal Care',
+    infrastructureType: 'Primary Healthcare',
+    confidence: '0.92',
+    aiReasoning:
+      'Transliterated Hindi request normalized to emergency healthcare deficit in Gadchiroli tribal block with severe night-time medical unavailability.',
+    analyzedByGemini: true,
     state: 'Maharashtra',
     district: 'Gadchiroli District',
     villageOrCity: 'Bhamragad Block',
@@ -1368,6 +1389,11 @@ export const INITIAL_CITIZEN_REQUESTS: CitizenRequestRecord[] = [
     extractedIssue: 'Non-functional tail-end drinking water pipeline & summer scarcity',
     category: 'Water',
     subcategory: 'Piped Drinking Water Supply (JJM)',
+    infrastructureType: 'Drinking Water Supply Grid',
+    confidence: '0.95',
+    aiReasoning:
+      'Devanagari Hindi input indicates dry drinking water pipelines across 14 desert habitations in Barmer District requiring 4 km daily travel.',
+    analyzedByGemini: true,
     state: 'Rajasthan',
     district: 'Barmer District',
     villageOrCity: 'Chohtan Tehsil',
@@ -1403,6 +1429,11 @@ export const INITIAL_CITIZEN_REQUESTS: CitizenRequestRecord[] = [
     extractedIssue: 'Collapsed culvert and flood-damaged rural arterial road',
     category: 'Roads',
     subcategory: 'All-Weather Rural Road & Culvert',
+    infrastructureType: 'Rural Arterial Road & Box Culvert',
+    confidence: '0.93',
+    aiReasoning:
+      'Hindi submission describes post-monsoon breach of main block road and culvert in Darbhanga District isolating schools and hospitals.',
+    analyzedByGemini: true,
     state: 'Bihar',
     district: 'Darbhanga District',
     villageOrCity: 'Kusheshwar Asthan',
@@ -1438,6 +1469,11 @@ export const INITIAL_CITIZEN_REQUESTS: CitizenRequestRecord[] = [
     extractedIssue: 'Overcrowded secondary classrooms and missing STEM laboratory',
     category: 'Education',
     subcategory: 'Secondary School Infrastructure',
+    infrastructureType: 'Secondary School & Science Lab',
+    confidence: '0.91',
+    aiReasoning:
+      'Marathi request highlights acute shortage of secondary classrooms and science laboratory infrastructure for 650 rural high school students.',
+    analyzedByGemini: true,
     state: 'Maharashtra',
     district: 'Pune District',
     villageOrCity: 'Junnar Taluka',

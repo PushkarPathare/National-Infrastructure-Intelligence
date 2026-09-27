@@ -7,6 +7,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   AuditLogEntry,
   CitizenRequestRecord,
+  CollectiveCluster,
   DevelopmentRecommendation,
   ManagedUserRecord,
   NavModule,
@@ -16,6 +17,7 @@ import {
 } from './types/platform';
 import {
   AI_RECOMMENDATIONS,
+  COLLECTIVE_CLUSTERS,
   DISTRICT_HOTSPOTS,
   INITIAL_CITIZEN_REQUESTS,
   INITIAL_NOTIFICATIONS,
@@ -78,6 +80,8 @@ export default function App() {
   );
   const [recommendations, setRecommendations] =
     useState<DevelopmentRecommendation[]>(AI_RECOMMENDATIONS);
+  const [clusters, setClusters] =
+    useState<CollectiveCluster[]>(COLLECTIVE_CLUSTERS);
   const [notifications, setNotifications] =
     useState<PlatformNotification[]>(INITIAL_NOTIFICATIONS);
 
@@ -238,14 +242,93 @@ export default function App() {
     setRequests((prev) => [newReq, ...prev]);
     setSelectedRequest(newReq);
 
+    const matchedDistId = resolveDistrictId(newReq.district);
+    if (matchedDistId) {
+      setSelectedDistrictId(matchedDistId);
+    }
+
     const normalizedDistrictLabel = newReq.district.toLowerCase().includes('district')
       ? newReq.district
       : `${newReq.district} District`;
 
+    // Connect to Collective Demand Clusters (Step 5 of End-to-End Flow)
+    setClusters((prev) =>
+      prev.map((clu) => {
+        if (clu.category !== newReq.category) return clu;
+        const updatedVol = clu.monthlyVolume.map((m, idx) =>
+          idx === clu.monthlyVolume.length - 1 ? { ...m, count: m.count + 1 } : m
+        );
+        return {
+          ...clu,
+          citizenReports: clu.citizenReports + 1,
+          monthlyVolume: updatedVol,
+          samplePhrases: [
+            { lang: newReq.detectedLanguage, text: newReq.citizenText },
+            ...clu.samplePhrases.slice(0, 2),
+          ],
+        };
+      })
+    );
+
+    // Connect to AI Recommendations pipeline (Step 9 of End-to-End Flow)
+    setRecommendations((prev) => {
+      const cleanDist = newReq.district.replace(/\s*district\s*/i, '').trim().toLowerCase();
+      const existingIdx = prev.findIndex(
+        (rec) =>
+          rec.category === newReq.category &&
+          rec.district.toLowerCase().includes(cleanDist)
+      );
+
+      if (existingIdx >= 0) {
+        return prev.map((rec, idx) =>
+          idx === existingIdx
+            ? {
+                ...rec,
+                priorityScore: Math.max(rec.priorityScore, newReq.priorityScore),
+                citizenDemandCount: Math.max(rec.citizenDemandCount + 1, newReq.similarRequestsCount),
+                problemAddressed: newReq.extractedIssue || rec.problemAddressed,
+                aiReasoning: newReq.aiReasoning || rec.aiReasoning,
+              }
+            : rec
+        );
+      }
+
+      const newRec: DevelopmentRecommendation = {
+        id: `rec-dyn-${Date.now()}`,
+        districtId: matchedDistId || 'dist-pune',
+        district: normalizedDistrictLabel,
+        state: newReq.state,
+        category: newReq.category,
+        priorityScore: newReq.priorityScore,
+        problemAddressed: newReq.extractedIssue,
+        citizenDemandCount: newReq.similarRequestsCount,
+        populationImpact: `${newReq.affectedPopulation.toLocaleString()} citizens`,
+        infrastructureGap: newReq.urgency === 'Critical' ? 'Critical' : 'High',
+        existingInvestment: 'Low',
+        recommendedProject: newReq.suggestedAction,
+        estimatedBeneficiaries: `${newReq.affectedPopulation.toLocaleString()} residents`,
+        estimatedBeneficiariesNum: newReq.affectedPopulation,
+        recommendedDepartment: newReq.assignedDepartment,
+        estimatedCostCr: newReq.category === 'Roads' ? 24.5 : newReq.category === 'Water' ? 18.0 : 14.2,
+        aiReasoning:
+          newReq.aiReasoning ||
+          `${newReq.infrastructureType || newReq.subcategory} deficit identified via Google Gemini semantic analysis and district infrastructure audit.`,
+        evidencePoints: [
+          `${newReq.similarRequestsCount} clustered citizen requests across ${newReq.nearbyVillagesCount} nearby habitations`,
+          `Normalized Need: ${newReq.translatedMeaning}`,
+          `Infrastructure Type: ${newReq.infrastructureType || newReq.subcategory}`,
+        ],
+        status: 'Pending Review',
+        defaultProjectCount: 2,
+      };
+
+      return [newRec, ...prev];
+    });
+
     handleAddAuditLog({
       user: roleProfile.demoUserName,
       role: activeRole,
-      action: `Submitted citizen request ${newReq.id} (${newReq.category} · ${newReq.urgency}) from ${newReq.villageOrCity}, ${newReq.district}`,
+      action: `Submitted citizen request ${newReq.id} (${newReq.category} · ${newReq.urgency}) analyzed by Google Gemini from ${newReq.villageOrCity}, ${newReq.district}`,
       module: MODULE_DISPLAY_NAMES['citizen-requests'] || 'Citizen Requests',
       jurisdiction: `${newReq.district}, ${newReq.state}`,
       status: 'Modified',
@@ -929,7 +1012,7 @@ export default function App() {
             <div className="p-3.5 rounded-2xl bg-slate-100/70 border border-slate-200/60 space-y-1">
               <div className="flex items-center gap-1.5 text-emerald-800 font-semibold text-[11px]">
                 <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-emerald-600" />
-                <span>Hackathon Demo • Simulated Role Access</span>
+                <span>HACKATHON DEMO • SIMULATED DATA</span>
               </div>
               <div className="text-[11px] text-slate-500 leading-relaxed">{t.dpgSub}</div>
             </div>
@@ -950,8 +1033,8 @@ export default function App() {
               <span className="px-3 py-1 rounded-full bg-blue-50/90 text-blue-800 border border-blue-200/70 font-medium text-[11px]">
                 {roleProfile.scopeBadge}
               </span>
-              <span className="hidden md:inline-block px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 font-mono text-[11px]">
-                Hackathon Demo • Simulated Role Access
+              <span className="hidden md:inline-block px-2.5 py-1 rounded-full bg-amber-50 text-amber-800 border border-amber-200/80 font-mono text-[11px] font-semibold">
+                HACKATHON DEMO • SIMULATED DATA
               </span>
             </div>
 
@@ -1383,6 +1466,7 @@ export default function App() {
                     uiLanguage={uiLanguage}
                     onLanguageChange={setUiLanguage}
                     requests={requests}
+                    clusters={clusters}
                     onAddRequest={handleAddRequest}
                     onUpdateRequest={handleUpdateRequest}
                     onSelectRequestForAnalysis={(req) => setSelectedRequest(req)}
@@ -1416,6 +1500,8 @@ export default function App() {
                     requests={requests}
                     selectedRequest={selectedRequest}
                     onSelectRequest={setSelectedRequest}
+                    onUpdateRequest={handleUpdateRequest}
+                    clusters={clusters}
                     onNavigate={handleNavigate}
                     activeRole={activeRole}
                   />
@@ -1507,7 +1593,7 @@ export default function App() {
                 onClick={() => setDemoLoginModalOpen(true)}
                 className="text-blue-700 hover:underline font-semibold cursor-pointer"
               >
-                Hackathon Demo • Simulated Role Access ({activeRole})
+                HACKATHON DEMO • SIMULATED DATA ({activeRole})
               </button>
               <button
                 type="button"

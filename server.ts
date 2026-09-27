@@ -224,85 +224,313 @@ function deterministicMultilingualAnalysis(payload: {
   };
 }
 
+const INFRASTRUCTURE_TYPE_MAP: Record<string, string> = {
+  Healthcare: 'Primary Healthcare',
+  Water: 'Piped Drinking Water Supply Grid',
+  Roads: 'All-Weather Rural Arterial Road',
+  Education: 'Secondary School & STEM Facility',
+  Electricity: '33/11 kV Power Substation & Feeder',
+  Sanitation: 'Community Sanitation & Drainage Network',
+  'Public Transport': 'Rural Public Bus Feeder Transit',
+  'Internet Connectivity': 'BharatNet Optical Fiber Broadband',
+  Housing: 'Rural & Urban Public Housing',
+  Agriculture: 'Micro-Irrigation & Agrarian Storage',
+  'Waste Management': 'Solid & Liquid Resource Management',
+  Other: 'Community Public Infrastructure',
+};
+
+const VALID_CATEGORIES = new Set([
+  'Healthcare',
+  'Education',
+  'Roads',
+  'Water',
+  'Sanitation',
+  'Electricity',
+  'Public Transport',
+  'Internet Connectivity',
+  'Housing',
+  'Agriculture',
+  'Waste Management',
+  'Other',
+]);
+
+const VALID_URGENCIES = new Set(['Critical', 'High', 'Medium', 'Low']);
+
+// In-memory cache to avoid repeated Gemini API calls for identical requests
+const geminiAnalysisCache = new Map<string, Record<string, unknown>>();
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
   app.use(express.json({ limit: '2mb' }));
 
-  // Endpoint 1: Multilingual AI Request Analysis
+  // Endpoint 1: Multilingual Gemini AI Request Analysis
   app.post('/api/ai/analyze-request', async (req, res) => {
     const payload = req.body || {};
-    const fallbackResult = deterministicMultilingualAnalysis(payload);
+    const rawText = typeof payload.text === 'string' ? payload.text.trim() : '';
+
+    if (!rawText) {
+      return res.status(400).json({
+        error: 'Please enter a citizen infrastructure request before analyzing.',
+        analyzedByGemini: false,
+      });
+    }
+
+    if (rawText.length < 5) {
+      return res.status(400).json({
+        error: 'Request description is too short. Please provide at least 5 characters.',
+        analyzedByGemini: false,
+      });
+    }
+
+    const cacheKey = JSON.stringify({
+      text: rawText.toLowerCase(),
+      language: payload.language || '',
+      state: payload.state || '',
+      district: payload.district || '',
+      village: payload.village || '',
+      category: payload.category || '',
+      urgency: payload.urgency || '',
+    });
+
+    if (geminiAnalysisCache.has(cacheKey)) {
+      return res.json({
+        ...geminiAnalysisCache.get(cacheKey),
+        cached: true,
+      });
+    }
+
+    // Existing analytical model evaluates demand, population impact, infrastructure gap, investment context, and priority score
+    const analyticalBaseline = deterministicMultilingualAnalysis(payload);
 
     const ai = getGeminiClient();
     if (!ai) {
-      return res.json({
-        ...fallbackResult,
-        engineMode: 'deterministic-nlp',
+      return res.status(503).json({
+        error: 'AI analysis temporarily unavailable.',
+        analyzedByGemini: false,
       });
     }
 
     try {
-      const prompt = `Analyze this citizen infrastructure development request from India.
-Citizen Input Text: "${payload.text || ''}"
-Selected Language Hint: "${payload.language || 'Auto-detect'}"
-Location: "${payload.village || ''}, ${payload.district || 'Pune'} District, ${payload.state || 'Maharashtra'}"
-Category Hint: "${payload.category || 'Healthcare'}"
-Urgency Hint: "${payload.urgency || 'High'}"
+      const locationContext = [
+        payload.village,
+        payload.district || 'Pune District',
+        payload.state || 'Maharashtra',
+      ]
+        .filter(Boolean)
+        .join(', ');
 
-Return a structured infrastructure intelligence analysis matching the schema.`;
+      const prompt = `Analyze the following citizen infrastructure development request submitted in India.
+
+Citizen Request Text: "${rawText}"
+Interface Language Context: "${payload.language || 'Auto-detect'}"
+Reported Location Context: "${locationContext}"
+Selected Category Context: "${payload.category || 'Auto-detect'}"
+Selected Urgency Context: "${payload.urgency || 'Auto-detect'}"
+
+Tasks:
+1. Detect the language of the citizen's text (e.g., English, Marathi, Hindi — including Devanagari script or Romanized/transliterated Marathi/Hindi).
+2. Translate and normalize the citizen's request into a concise, standardized English policy representation of the development need (e.g., "Limited access to primary healthcare facilities").
+3. Classify the development category (must be one of: Healthcare, Water, Roads, Education, Electricity, Sanitation, Public Transport, Internet Connectivity, Housing, Agriculture, Waste Management, Other) and specific subcategory.
+4. Identify the relevant infrastructure type (e.g., "Primary Healthcare", "Piped Water Supply Grid", "All-Weather Rural Road", "Secondary School Facility").
+5. Extract or confirm the location/region (e.g., "Pune District").
+6. Determine the urgency level (Critical, High, Medium, or Low).
+7. Write a concise 1-2 sentence policy summary of the issue.
+8. Provide a clear AI explanation/reasoning describing how the language, issue, and infrastructure need were interpreted.
+9. Provide a confidence score between 0.85 and 0.98 (formatted as a decimal string such as "0.91").`;
 
       const response = await ai.models.generateContent({
         model: 'gemini-3.8-flash',
         contents: prompt,
         config: {
           systemInstruction:
-            'You are the National Infrastructure Intelligence Engine for India (Digital Public Good). Detect the language strictly among English, Marathi, or Hindi (including Devanagari or transliterated text), translate/normalize into clear English, extract the core infrastructure issue, classify category and subcategory, estimate urgency and priority score (0-100), and provide an authoritative policy summary.',
+            'You are the National Infrastructure Intelligence Engine for India (Digital Public Good). Analyze multilingual citizen development requests (English, Hindi, Marathi) and return structured JSON strictly adhering to the response schema.',
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              detectedLanguage: { type: Type.STRING },
-              translatedMeaning: { type: Type.STRING },
-              extractedIssue: { type: Type.STRING },
-              category: { type: Type.STRING },
-              subcategory: { type: Type.STRING },
-              urgency: { type: Type.STRING },
-              sentiment: { type: Type.STRING },
-              existingInfrastructure: { type: Type.STRING },
-              priorityScore: { type: Type.INTEGER },
-              assignedDepartment: { type: Type.STRING },
-              aiSummary: { type: Type.STRING },
-              suggestedAction: { type: Type.STRING },
+              language: {
+                type: Type.STRING,
+                description: 'Detected language of the request: English, Marathi, or Hindi',
+              },
+              originalText: {
+                type: Type.STRING,
+                description: 'The original citizen request text',
+              },
+              normalizedIssue: {
+                type: Type.STRING,
+                description: 'Normalized English meaning / standardized development need',
+              },
+              category: {
+                type: Type.STRING,
+                description: 'Standardized development category',
+              },
+              subcategory: {
+                type: Type.STRING,
+                description: 'Specific subcategory of the infrastructure need',
+              },
+              location: {
+                type: Type.STRING,
+                description: 'Extracted or confirmed district/region location',
+              },
+              urgency: {
+                type: Type.STRING,
+                description: 'Urgency level: Critical, High, Medium, or Low',
+              },
+              summary: {
+                type: Type.STRING,
+                description: 'Short factual summary of the citizen development request',
+              },
+              infrastructureType: {
+                type: Type.STRING,
+                description: 'Relevant public infrastructure type (e.g. Primary Healthcare)',
+              },
+              confidence: {
+                type: Type.STRING,
+                description: 'Confidence score between 0.80 and 0.99, e.g. "0.91"',
+              },
+              reasoning: {
+                type: Type.STRING,
+                description: 'AI explanation and reasoning for the classification and normalization',
+              },
             },
             required: [
-              'detectedLanguage',
-              'translatedMeaning',
-              'extractedIssue',
+              'language',
+              'originalText',
+              'normalizedIssue',
               'category',
               'subcategory',
+              'location',
               'urgency',
-              'priorityScore',
-              'assignedDepartment',
-              'aiSummary',
-              'suggestedAction',
+              'summary',
+              'infrastructureType',
+              'confidence',
+              'reasoning',
             ],
           },
         },
       });
 
-      const parsed = JSON.parse(response.text || '{}');
-      return res.json({
-        ...fallbackResult,
-        ...parsed,
-        engineMode: 'gemini-3.8-flash',
+      const rawOutput = (response.text || '').trim();
+      if (!rawOutput) {
+        return res.status(503).json({
+          error: 'AI analysis temporarily unavailable.',
+          analyzedByGemini: false,
+        });
+      }
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(rawOutput);
+      } catch {
+        return res.status(503).json({
+          error: 'AI analysis temporarily unavailable.',
+          analyzedByGemini: false,
+        });
+      }
+
+      // Validate and sanitize every field gracefully
+      const rawLang = String(parsed.language || analyticalBaseline.detectedLanguage || 'English').trim();
+      const normalizedLang = rawLang.toLowerCase().includes('marathi')
+        ? 'Marathi'
+        : rawLang.toLowerCase().includes('hindi')
+        ? 'Hindi'
+        : 'English';
+
+      const rawCat = String(parsed.category || payload.category || analyticalBaseline.category || 'Healthcare').trim();
+      const validCategory = VALID_CATEGORIES.has(rawCat)
+        ? rawCat
+        : VALID_CATEGORIES.has(payload.category)
+        ? String(payload.category)
+        : analyticalBaseline.category;
+
+      const rawUrg = String(parsed.urgency || payload.urgency || analyticalBaseline.urgency || 'High').trim();
+      const validUrgency = VALID_URGENCIES.has(rawUrg)
+        ? rawUrg
+        : VALID_URGENCIES.has(payload.urgency)
+        ? String(payload.urgency)
+        : analyticalBaseline.urgency;
+
+      const normalizedIssue =
+        String(parsed.normalizedIssue || '').trim() ||
+        analyticalBaseline.extractedIssue;
+      const subcategory =
+        String(parsed.subcategory || '').trim() ||
+        analyticalBaseline.subcategory;
+      const locationStr =
+        String(parsed.location || '').trim() ||
+        (payload.district ? String(payload.district) : 'Pune District');
+      const summaryStr =
+        String(parsed.summary || '').trim() ||
+        analyticalBaseline.translatedMeaning;
+      const infrastructureType =
+        String(parsed.infrastructureType || '').trim() ||
+        INFRASTRUCTURE_TYPE_MAP[validCategory] ||
+        'Public Infrastructure';
+
+      let confidenceVal = parseFloat(String(parsed.confidence || '0.91'));
+      if (Number.isNaN(confidenceVal) || confidenceVal <= 0 || confidenceVal > 1) {
+        confidenceVal = 0.91;
+      }
+      const confidenceStr = confidenceVal.toFixed(2);
+
+      const reasoningStr =
+        String(parsed.reasoning || '').trim() ||
+        `Gemini analyzed the ${normalizedLang} citizen request and classified it under ${validCategory} (${infrastructureType}) with ${validUrgency.toLowerCase()} urgency based on reported local access constraints.`;
+
+      const assignedDepartment =
+        DEPARTMENT_MAP[validCategory] || DEPARTMENT_MAP.Other;
+
+      // Keep the existing analytical prioritization model for demand, population impact, infrastructure gap, investment context, and priority score (Section 8)
+      const recomputedAnalytical = deterministicMultilingualAnalysis({
+        ...payload,
+        category: validCategory,
+        urgency: validUrgency,
       });
-    } catch (err) {
-      // Fallback cleanly to deterministic multilingual engine so UX never breaks
-      return res.json({
-        ...fallbackResult,
-        engineMode: 'deterministic-nlp',
+
+      const structuredGeminiOutput = {
+        language: normalizedLang,
+        originalText: rawText,
+        normalizedIssue,
+        category: validCategory,
+        subcategory,
+        location: locationStr,
+        urgency: validUrgency,
+        summary: summaryStr,
+        infrastructureType,
+        confidence: confidenceStr,
+        reasoning: reasoningStr,
+      };
+
+      const resultPayload = {
+        // Exact Section 7 structured output fields
+        ...structuredGeminiOutput,
+        structuredOutput: structuredGeminiOutput,
+        // Existing pipeline fields + analytical priority score from existing model
+        detectedLanguage: normalizedLang,
+        translatedMeaning: summaryStr,
+        extractedIssue: normalizedIssue,
+        sentiment: recomputedAnalytical.sentiment,
+        affectedPopulation: recomputedAnalytical.affectedPopulation,
+        similarRequestsCount: recomputedAnalytical.similarRequestsCount,
+        nearbyVillagesCount: recomputedAnalytical.nearbyVillagesCount,
+        recentPercentage: recomputedAnalytical.recentPercentage,
+        existingInfrastructure: recomputedAnalytical.existingInfrastructure,
+        priorityScore: recomputedAnalytical.priorityScore,
+        assignedDepartment,
+        aiSummary: `${summaryStr} (${recomputedAnalytical.similarRequestsCount} clustered requests across ${recomputedAnalytical.nearbyVillagesCount} nearby villages in ${payload.district || locationStr}).`,
+        suggestedAction: recomputedAnalytical.suggestedAction,
+        analyzedByGemini: true,
+        engineMode: 'gemini-3.8-flash',
+      };
+
+      geminiAnalysisCache.set(cacheKey, resultPayload);
+      return res.json(resultPayload);
+    } catch {
+      return res.status(503).json({
+        error: 'AI analysis temporarily unavailable.',
+        analyzedByGemini: false,
       });
     }
   });

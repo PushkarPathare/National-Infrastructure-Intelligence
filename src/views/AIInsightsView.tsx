@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   CitizenRequestRecord,
   CollectiveCluster,
   DistrictHotspot,
+  GeminiStructuredAnalysis,
   InfrastructureCategory,
   NavModule,
   StateIntelligence,
@@ -22,15 +23,26 @@ import { InteractiveDonutChart } from '../components/charts/PlatformCharts';
 import {
   ArrowRight,
   SlidersHorizontal,
+  Sparkles,
+  CheckCircle2,
+  AlertTriangle,
+  Loader2,
 } from 'lucide-react';
 import { UserRole } from '../types/platform';
 import { RBAC_PROFILES } from '../data/rbacData';
+import {
+  getCachedAnalysisByRequestId,
+  seedInitialRequestsCache,
+  setCachedAnalysisByRequestId,
+} from '../utils/requestAnalysisCache';
 
 interface AIInsightsViewProps {
   uiLanguage: SupportedLanguage;
   requests: CitizenRequestRecord[];
   selectedRequest: CitizenRequestRecord;
   onSelectRequest: (req: CitizenRequestRecord) => void;
+  onUpdateRequest?: (req: CitizenRequestRecord) => void;
+  clusters?: CollectiveCluster[];
   onNavigate: (module: NavModule, districtId?: string) => void;
   activeRole?: UserRole;
 }
@@ -40,6 +52,8 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
   requests,
   selectedRequest,
   onSelectRequest,
+  onUpdateRequest,
+  clusters = COLLECTIVE_CLUSTERS,
   onNavigate,
   activeRole = 'National Policymaker',
 }) => {
@@ -56,7 +70,149 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
   const [investmentFilter, setInvestmentFilter] = useState<string>('All');
 
   // Collective Cluster Selection
-  const [activeCluster, setActiveCluster] = useState<CollectiveCluster>(COLLECTIVE_CLUSTERS[0]);
+  const [activeCluster, setActiveCluster] = useState<CollectiveCluster>(clusters[0] || COLLECTIVE_CLUSTERS[0]);
+
+  useEffect(() => {
+    seedInitialRequestsCache(requests);
+  }, [requests]);
+
+  useEffect(() => {
+    const matching = clusters.find((c) => c.category === selectedRequest.category);
+    if (matching) {
+      setActiveCluster(matching);
+    }
+  }, [selectedRequest.id, selectedRequest.category, clusters]);
+
+  // Gemini Live Inspection State & Shared Client-Side Cache by Request ID
+  const [geminiInspectStatus, setGeminiInspectStatus] = useState<'idle' | 'analyzing' | 'analyzed' | 'error'>(() =>
+    selectedRequest.analyzedByGemini || Boolean(getCachedAnalysisByRequestId(selectedRequest.id))
+      ? 'analyzed'
+      : 'idle'
+  );
+  const [geminiInspectError, setGeminiInspectError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setGeminiInspectError(null);
+    const cachedEntry = getCachedAnalysisByRequestId(selectedRequest.id);
+    setGeminiInspectStatus(
+      selectedRequest.analyzedByGemini || Boolean(cachedEntry) ? 'analyzed' : 'idle'
+    );
+  }, [selectedRequest.id, selectedRequest.analyzedByGemini]);
+
+  const resolveMatchedDistrictId = (districtName?: string): string => {
+    if (!districtName) return 'dist-pune';
+    const clean = districtName.replace(/\s*district\s*/i, '').trim().toLowerCase();
+    const matched = DISTRICT_HOTSPOTS.find(
+      (d) =>
+        d.district.toLowerCase() === clean ||
+        clean.includes(d.district.toLowerCase()) ||
+        d.district.toLowerCase().includes(clean)
+    );
+    return matched?.id || 'dist-pune';
+  };
+
+  const handleAnalyzeSelectedWithGemini = async () => {
+    setGeminiInspectError(null);
+
+    // Check shared client-side cache keyed by request ID first to prevent redundant API calls
+    const cachedById = getCachedAnalysisByRequestId(selectedRequest.id);
+    if (cachedById) {
+      if (onUpdateRequest && !selectedRequest.analyzedByGemini) {
+        onUpdateRequest({
+          ...selectedRequest,
+          translatedMeaning: cachedById.structured.normalizedIssue,
+          extractedIssue: cachedById.structured.normalizedIssue,
+          subcategory: cachedById.structured.subcategory,
+          infrastructureType: cachedById.structured.infrastructureType,
+          aiSummary: cachedById.structured.summary,
+          aiReasoning: cachedById.structured.reasoning,
+          confidence: cachedById.structured.confidence,
+          analyzedByGemini: true,
+          geminiAnalysis: cachedById.structured,
+        });
+      }
+      setGeminiInspectStatus('analyzed');
+      return;
+    }
+
+    setGeminiInspectStatus('analyzing');
+    try {
+      const response = await fetch('/api/ai/analyze-request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          requestId: selectedRequest.id,
+          text: selectedRequest.citizenText,
+          language: selectedRequest.detectedLanguage,
+          state: selectedRequest.state,
+          district: selectedRequest.district,
+          village: selectedRequest.villageOrCity,
+          category: selectedRequest.category,
+          urgency: selectedRequest.urgency,
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data || data.error || data.analyzedByGemini === false) {
+        setGeminiInspectStatus('error');
+        setGeminiInspectError(
+          (typeof data?.error === 'string' && data.error) ||
+            data?.message ||
+            'AI analysis temporarily unavailable.'
+        );
+        return;
+      }
+
+      const confNum = Number(data.confidence);
+      const safeConf = Number.isFinite(confNum)
+        ? confNum > 1
+          ? (confNum / 100).toFixed(2)
+          : confNum.toFixed(2)
+        : selectedRequest.confidence || '0.91';
+
+      const structured: GeminiStructuredAnalysis = {
+        language: String(data.language || selectedRequest.detectedLanguage),
+        originalText: String(data.originalText || selectedRequest.citizenText),
+        normalizedIssue: String(data.normalizedIssue || selectedRequest.translatedMeaning),
+        category: String(data.category || selectedRequest.category),
+        subcategory: String(data.subcategory || selectedRequest.subcategory),
+        location: String(data.location || `${selectedRequest.district}, ${selectedRequest.state}`),
+        urgency: String(data.urgency || selectedRequest.urgency),
+        summary: String(data.summary || selectedRequest.aiSummary),
+        infrastructureType: String(
+          data.infrastructureType || selectedRequest.infrastructureType || selectedRequest.subcategory
+        ),
+        confidence: String(safeConf),
+        reasoning: String(data.reasoning || selectedRequest.aiReasoning || ''),
+      };
+
+      const updates: Partial<CitizenRequestRecord> = {
+        translatedMeaning: structured.normalizedIssue,
+        extractedIssue: structured.normalizedIssue,
+        subcategory: structured.subcategory,
+        infrastructureType: structured.infrastructureType,
+        aiSummary: structured.summary,
+        aiReasoning: structured.reasoning,
+        confidence: String(safeConf),
+        analyzedByGemini: true,
+        geminiAnalysis: structured,
+      };
+
+      // Save in shared client-side cache keyed by request ID
+      setCachedAnalysisByRequestId(selectedRequest.id, structured, data);
+
+      if (onUpdateRequest) {
+        onUpdateRequest({
+          ...selectedRequest,
+          ...updates,
+        });
+      }
+      setGeminiInspectStatus('analyzed');
+    } catch {
+      setGeminiInspectStatus('error');
+      setGeminiInspectError('AI analysis temporarily unavailable.');
+    }
+  };
 
   // Compute SVG coordinates for the 6-Month Cluster Velocity Area+Bar Chart
   const maxClusterVol = Math.max(...activeCluster.monthlyVolume.map((m) => m.count), 100);
@@ -81,9 +237,14 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
           <span className="font-semibold text-blue-700">{roleProfile.aiInsightCallout}</span>
           <span className="text-slate-600">{roleProfile.aiInsightSubtext}</span>
         </div>
-        <span className="px-3 py-1 rounded-full bg-slate-100 border border-slate-200/80 text-slate-700 font-mono font-medium">
-          Role: {activeRole}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="px-2.5 py-1 rounded-full bg-amber-50 border border-amber-200/80 text-amber-800 font-mono text-[10px] font-bold">
+            HACKATHON DEMO • SIMULATED DATA
+          </span>
+          <span className="px-3 py-1 rounded-full bg-slate-100 border border-slate-200/80 text-slate-700 font-mono font-medium">
+            Role: {activeRole}
+          </span>
+        </div>
       </div>
 
       {/* SECTION 9: NATIONAL DEVELOPMENT INTELLIGENCE HEADER & TOP KPIs */}
@@ -293,8 +454,26 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
       {/* SECTION 7: DETAILED AI REQUEST ANALYSIS WITH MULTI-FACTOR SCORE BAR GRAPH */}
       <section className="bg-white border border-slate-200/80 rounded-3xl p-7 sm:p-10 shadow-sm space-y-8">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200/70 pb-6">
-          <div className="space-y-1">
-            <div className="text-[11px] font-bold uppercase tracking-widest text-blue-700">{t.deepInspectionBadge}</div>
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] font-bold uppercase tracking-widest text-blue-700">{t.deepInspectionBadge}</span>
+              {geminiInspectStatus === 'analyzing' ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200/80 text-[11px] font-semibold">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  <span>Analyzing with Gemini AI...</span>
+                </span>
+              ) : geminiInspectStatus === 'error' ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-200/80 text-[11px] font-semibold">
+                  <AlertTriangle className="w-3 h-3" />
+                  <span>AI analysis temporarily unavailable.</span>
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200/80 text-[11px] font-semibold">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                  <span>Analyzed by Google Gemini</span>
+                </span>
+              )}
+            </div>
             <h2 className="text-2xl font-bold tracking-tight text-slate-950">{t.deepInspectionTitle}</h2>
           </div>
 
@@ -314,27 +493,91 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
                 {r.id}
               </button>
             ))}
+            <button
+              type="button"
+              disabled={geminiInspectStatus === 'analyzing'}
+              onClick={handleAnalyzeSelectedWithGemini}
+              className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200/80 transition-all inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+            >
+              {geminiInspectStatus === 'analyzing' ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Analyzing with Gemini AI...</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Run Live Gemini Analysis</span>
+                </>
+              )}
+            </button>
           </div>
         </div>
+
+        {geminiInspectStatus === 'error' && geminiInspectError && (
+          <div className="p-4 rounded-2xl bg-red-50/90 border border-red-200 text-xs text-red-900 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+              <span className="font-semibold">{geminiInspectError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={handleAnalyzeSelectedWithGemini}
+              className="px-3 py-1.5 rounded-xl bg-white border border-red-200 text-red-700 font-semibold hover:bg-red-100 transition-colors cursor-pointer"
+            >
+              Retry Gemini Analysis
+            </button>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           {/* Left: Structured AI Analysis Attributes + Priority Factor Graph */}
           <div className="lg:col-span-7 space-y-5">
-            <div className="p-5 sm:p-6 rounded-2xl bg-white border border-slate-200/80 shadow-sm space-y-2.5">
-              <div className="flex items-center justify-between text-xs text-slate-500">
+            {/* Multilingual Semantic Pipeline Box: Original Language -> AI Interpretation -> Standardized Development Need */}
+            <div className="p-5 sm:p-6 rounded-2xl bg-white border border-slate-200/80 shadow-sm space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
                 <span className="font-mono font-bold text-blue-700">{selectedRequest.id}</span>
-                <span>
-                  Language: <strong className="text-slate-950">{selectedRequest.detectedLanguage}</strong> · Submitted {selectedRequest.submittedAt}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span>
+                    Detected Language: <strong className="text-slate-950">{selectedRequest.detectedLanguage}</strong>
+                  </span>
+                  <span>·</span>
+                  <span>
+                    Confidence:{' '}
+                    <strong className="font-mono text-emerald-700">
+                      {selectedRequest.confidence || '0.92'}
+                    </strong>
+                  </span>
+                </div>
               </div>
-              <p className="text-base font-semibold text-slate-950 leading-relaxed">
-                “{selectedRequest.citizenText}”
-              </p>
-              {selectedRequest.detectedLanguage !== 'English' && (
-                <p className="text-xs text-slate-600 pt-2 border-t border-slate-100">
-                  Normalized Meaning: “{selectedRequest.translatedMeaning}”
+
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  Original Citizen Request ({selectedRequest.detectedLanguage})
+                </div>
+                <p className="text-base font-semibold text-slate-950 leading-relaxed mt-0.5">
+                  “{selectedRequest.citizenText}”
                 </p>
-              )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2.5 border-t border-slate-100 text-xs">
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/70">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-blue-700">
+                    Normalized Meaning (AI Interpretation)
+                  </div>
+                  <div className="font-semibold text-slate-900 mt-1">
+                    {selectedRequest.translatedMeaning}
+                  </div>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/70">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-teal-700">
+                    Standardized Development Need / Infrastructure Type
+                  </div>
+                  <div className="font-semibold text-slate-900 mt-1">
+                    {selectedRequest.infrastructureType || selectedRequest.subcategory} ({selectedRequest.category})
+                  </div>
+                </div>
+              </div>
             </div>
 
             {/* Metadata Grid */}
@@ -343,6 +586,15 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
                 <div className="font-bold text-sm text-slate-950">{selectedRequest.category}</div>
                 <div className="text-slate-500 font-medium mt-1">Category & Subcategory</div>
                 <div className="text-[11px] text-slate-400 mt-0.5">{selectedRequest.subcategory}</div>
+              </div>
+              <div className="p-4 sm:p-5 rounded-2xl bg-white border border-slate-200/80 shadow-sm">
+                <div className="font-bold text-sm text-slate-950">
+                  {selectedRequest.infrastructureType || selectedRequest.subcategory}
+                </div>
+                <div className="text-slate-500 font-medium mt-1">Infrastructure Type</div>
+                <div className="text-[11px] text-slate-400 mt-0.5">
+                  Confidence: {selectedRequest.confidence || '0.92'}
+                </div>
               </div>
               <div className="p-4 sm:p-5 rounded-2xl bg-white border border-slate-200/80 shadow-sm">
                 <div className="font-bold text-sm text-slate-950">{selectedRequest.district}</div>
@@ -361,11 +613,6 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
                   {selectedRequest.affectedPopulation.toLocaleString()}
                 </div>
                 <div className="text-slate-500 font-medium mt-1">Potential Affected Population</div>
-                <div className="text-[11px] text-slate-400 mt-0.5">Local habitation catchment</div>
-              </div>
-              <div className="p-4 sm:p-5 rounded-2xl bg-white border border-slate-200/80 shadow-sm">
-                <div className="font-bold text-sm text-blue-700">{selectedRequest.status}</div>
-                <div className="text-slate-500 font-medium mt-1">Current Workflow Status</div>
                 <div className="text-[11px] text-slate-400 mt-0.5">
                   {selectedRequest.assignedDepartment}
                 </div>
@@ -375,17 +622,19 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
                   {selectedRequest.priorityScore} / 100
                 </div>
                 <div className="text-slate-500 font-medium mt-1">Explainable Priority Score</div>
-                <div className="text-[11px] text-slate-400 mt-0.5">High Priority Band</div>
+                <div className="text-[11px] text-slate-400 mt-0.5">Analytical Model Score</div>
               </div>
             </div>
 
             {/* Request Priority Sub-Score Decomposition Graph */}
             <div className="p-5 sm:p-6 rounded-2xl bg-white border border-slate-200/80 shadow-sm space-y-3.5 text-xs">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="font-bold text-slate-950">
-                  AI Priority Score Decomposition Graph ({selectedRequest.priorityScore}/100)
+                  Explainable Priority Model ({selectedRequest.priorityScore}/100)
                 </span>
-                <span className="font-mono text-slate-500">5 Weighted Signals</span>
+                <span className="font-mono text-[11px] text-blue-700 font-semibold">
+                  Gemini Semantic Understanding + Analytical Gap Model = Priority Score
+                </span>
               </div>
 
               <div className="grid grid-cols-5 gap-3 pt-1">
@@ -413,14 +662,22 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
             </div>
           </div>
 
-          {/* Right: AI Summary + Clustered Similar Requests Box */}
+          {/* Right: AI Summary + AI Reasoning + Clustered Similar Requests Box */}
           <div className="lg:col-span-5 flex flex-col justify-between bg-white text-slate-900 rounded-2xl p-6 sm:p-7 border border-slate-200/80 shadow-sm space-y-6">
             <div className="space-y-5">
               <div>
-                <div className="text-[11px] font-bold uppercase tracking-widest text-blue-700">AI-Generated Policy Summary</div>
+                <div className="text-[11px] font-bold uppercase tracking-widest text-blue-700">
+                  Gemini Summary & Policy Explanation
+                </div>
                 <p className="text-sm text-slate-900 font-medium mt-2.5 leading-relaxed bg-white border border-slate-200/80 shadow-sm p-4 rounded-xl">
                   “{selectedRequest.aiSummary}”
                 </p>
+                {selectedRequest.aiReasoning && (
+                  <div className="mt-2.5 p-3.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs text-slate-700 leading-relaxed">
+                    <span className="font-bold text-slate-900">AI Reasoning: </span>
+                    {selectedRequest.aiReasoning}
+                  </div>
+                )}
               </div>
 
               {/* Similar Requests Cluster Card */}
@@ -455,22 +712,56 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
               </div>
             </div>
 
-            <div className="flex items-center justify-between gap-3 pt-4 border-t border-slate-100">
-              <button
-                type="button"
-                onClick={() => onNavigate('department-actions')}
-                className="px-4 py-2.5 bg-slate-950 hover:bg-slate-800 text-white text-xs font-semibold rounded-xl transition-colors cursor-pointer"
-              >
-                Open Officer Workflow
-              </button>
-              <button
-                type="button"
-                onClick={() => onNavigate('impact-simulator', 'dist-pune')}
-                className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-xl transition-colors flex items-center gap-1.5 cursor-pointer"
-              >
-                <span>Simulate Project Impact</span>
-                <ArrowRight className="w-3.5 h-3.5" />
-              </button>
+            <div className="space-y-3 pt-4 border-t border-slate-100">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                Follow Complete End-to-End Intelligence Pipeline
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    onNavigate('demand-hotspots', resolveMatchedDistrictId(selectedRequest.district))
+                  }
+                  className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold rounded-xl transition-colors cursor-pointer"
+                >
+                  1. Demand Hotspot
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onNavigate('infrastructure-gaps', resolveMatchedDistrictId(selectedRequest.district))
+                  }
+                  className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold rounded-xl transition-colors cursor-pointer"
+                >
+                  2. Infrastructure Gap
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onNavigate('recommendations', resolveMatchedDistrictId(selectedRequest.district))
+                  }
+                  className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold rounded-xl transition-colors cursor-pointer"
+                >
+                  3. Recommendation
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onNavigate('impact-simulator', resolveMatchedDistrictId(selectedRequest.district))
+                  }
+                  className="px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-xl transition-colors flex items-center gap-1 cursor-pointer"
+                >
+                  <span>4. Impact Simulator</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onNavigate('department-actions')}
+                  className="px-3 py-2 bg-slate-950 hover:bg-slate-800 text-white text-xs font-semibold rounded-xl transition-colors cursor-pointer"
+                >
+                  5. Department Action
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -486,7 +777,7 @@ export const AIInsightsView: React.FC<AIInsightsViewProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {COLLECTIVE_CLUSTERS.map((clu) => (
+            {clusters.map((clu) => (
               <button
                 key={clu.id}
                 type="button"

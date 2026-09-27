@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   CitizenRequestRecord,
   CollectiveCluster,
+  GeminiStructuredAnalysis,
   InfrastructureCategory,
   NavModule,
   SupportedLanguage,
@@ -15,6 +16,14 @@ import {
 } from '../data/nationalData';
 import { TRANSLATIONS } from '../data/translations';
 import { RBAC_PROFILES } from '../data/rbacData';
+import {
+  getCachedAnalysisByContentKey,
+  getCachedAnalysisByRequestId,
+  getLastSubmittedRequestCache,
+  seedInitialRequestsCache,
+  setCachedAnalysisByRequestId,
+  setLastSubmittedRequestCache,
+} from '../utils/requestAnalysisCache';
 import {
   Send,
   Sparkles,
@@ -36,6 +45,7 @@ import {
   RotateCcw,
   PlusCircle,
   Save,
+  Loader2,
 } from 'lucide-react';
 
 export type CitizenSubTab = 'all' | 'submit' | 'my-requests' | 'community' | 'status';
@@ -63,6 +73,7 @@ export interface CitizenRequestFormErrors {
 export type RequiredFieldKey = keyof CitizenRequestFormErrors;
 
 export interface PersistedCitizenDraft {
+  draftRequestId?: string;
   formData: CitizenRequestFormData;
   attachedFile: string | null;
   selectedScenarioIdx: number;
@@ -73,6 +84,21 @@ export interface PersistedCitizenDraft {
 const CITIZEN_DRAFT_STORAGE_KEY = 'bharat_citizen_request_form_draft_v1';
 const MIN_DESCRIPTION_CHARS = 5;
 const MAX_DESCRIPTION_CHARS = 500;
+
+const AI_PROCESSING_STEPS = [
+  'Receiving request',
+  'Gemini analyzing text',
+  'Classifying development need',
+  'Mapping request',
+  'Updating intelligence',
+];
+
+function generateRequestIdForState(stateName: string): string {
+  const stateCode =
+    STATES_INTELLIGENCE.find((s) => s.name === stateName.trim())?.code || 'IN';
+  const randomId = Math.floor(10000 + Math.random() * 89999);
+  return `REQ-${stateCode}-${randomId}`;
+}
 
 let inMemoryDraftCache: PersistedCitizenDraft | null = null;
 
@@ -123,6 +149,7 @@ interface CitizenRequestsViewProps {
   uiLanguage: SupportedLanguage;
   onLanguageChange: (lang: SupportedLanguage) => void;
   requests: CitizenRequestRecord[];
+  clusters?: CollectiveCluster[];
   onAddRequest: (newReq: CitizenRequestRecord) => void;
   onUpdateRequest?: (updated: CitizenRequestRecord) => void;
   onSelectRequestForAnalysis: (req: CitizenRequestRecord) => void;
@@ -651,6 +678,7 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
   uiLanguage,
   onLanguageChange,
   requests,
+  clusters = COLLECTIVE_CLUSTERS,
   onAddRequest,
   onUpdateRequest,
   onSelectRequestForAnalysis,
@@ -731,9 +759,52 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
   const [attachedFile, setAttachedFile] = useState<string | null>(() =>
     initialPersistedDraft?.attachedFile || null
   );
-  const [justSubmitted, setJustSubmitted] = useState<CitizenRequestRecord | null>(null);
+  const [justSubmitted, setJustSubmitted] = useState<CitizenRequestRecord | null>(() =>
+    getLastSubmittedRequestCache()
+  );
 
-  // Automatically persist form inputs as a local Draft whenever formData or attachedFile changes
+  // Stable Request ID for the current draft submission flow (used as primary key in client-side analysis cache)
+  const [draftRequestId, setDraftRequestId] = useState<string>(() => {
+    if (initialPersistedDraft?.draftRequestId) {
+      return initialPersistedDraft.draftRequestId;
+    }
+    const defaultState = initialPersistedDraft?.formData?.state || 'Maharashtra';
+    return generateRequestIdForState(defaultState);
+  });
+
+  // Seed initial requests into the client-side cache keyed by request ID
+  useEffect(() => {
+    seedInitialRequestsCache(requests);
+  }, [requests]);
+
+  // Real Google Gemini AI Analysis states (restored from client-side cache by request ID when navigating between views)
+  const [geminiState, setGeminiState] = useState<'idle' | 'analyzing' | 'analyzed' | 'error'>(() => {
+    const cachedById = getCachedAnalysisByRequestId(
+      initialPersistedDraft?.draftRequestId
+    );
+    return cachedById ? 'analyzed' : 'idle';
+  });
+  const [processingStepIdx, setProcessingStepIdx] = useState<number>(0);
+  const [geminiErrorMsg, setGeminiErrorMsg] = useState<string | null>(null);
+  const [liveGeminiAnalysis, setLiveGeminiAnalysis] = useState<{
+    requestId: string;
+    cacheKey: string;
+    data: Record<string, unknown>;
+  } | null>(() => {
+    const cachedById = getCachedAnalysisByRequestId(
+      initialPersistedDraft?.draftRequestId
+    );
+    if (cachedById) {
+      return {
+        requestId: cachedById.requestId,
+        cacheKey: cachedById.contentKey || '',
+        data: cachedById.raw,
+      };
+    }
+    return null;
+  });
+
+  // Automatically persist form inputs and draftRequestId as a local Draft whenever formData or attachedFile changes
   useEffect(() => {
     const timestamp = new Date().toLocaleTimeString([], {
       hour: '2-digit',
@@ -741,6 +812,7 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
       second: '2-digit',
     });
     const draftPayload: PersistedCitizenDraft = {
+      draftRequestId,
       formData,
       attachedFile,
       selectedScenarioIdx,
@@ -749,7 +821,7 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
     };
     saveDraftToStorage(draftPayload);
     setDraftSavedAt(timestamp);
-  }, [formData, attachedFile, selectedScenarioIdx, isDraftModified]);
+  }, [draftRequestId, formData, attachedFile, selectedScenarioIdx, isDraftModified]);
 
   // Synchronize form language, preset sample text, preset landmark, and active validation messages when uiLanguage changes
   // Only overwrite fields with sample scenario values if the user has NOT modified the draft (`!isDraftModified`)
@@ -948,6 +1020,7 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
     setIsDraftModified(false);
     setWasRestoredFromDraft(false);
     clearDraftFromStorage();
+    setDraftRequestId(generateRequestIdForState('Maharashtra'));
     setFormData({
       language: uiLanguage,
       state: '',
@@ -962,6 +1035,9 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
     setFormErrors({});
     setTouchedFields({});
     setJustSubmitted(null);
+    setLastSubmittedRequestCache(null);
+    setLiveGeminiAnalysis(null);
+    setGeminiState('idle');
   };
 
   const handleDiscardDraftAndResetSample = () => {
@@ -969,10 +1045,14 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
     setIsDraftModified(false);
     setWasRestoredFromDraft(false);
     setSelectedScenarioIdx(0);
-    setFormData(buildDefaultFormData(uiLanguage, 0));
+    const defaultData = buildDefaultFormData(uiLanguage, 0);
+    setDraftRequestId(generateRequestIdForState(defaultData.state));
+    setFormData(defaultData);
     setAttachedFile(null);
     setFormErrors({});
     setTouchedFields({});
+    setLiveGeminiAnalysis(null);
+    setGeminiState('idle');
   };
 
   const handlePrefillFromCommunityIssue = (
@@ -1183,9 +1263,366 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
     activeUrgency
   );
 
+  const buildRequestCacheKey = (data: CitizenRequestFormData) =>
+    JSON.stringify({
+      text: data.text.trim().toLowerCase(),
+      language: uiLanguage,
+      state: data.state.trim(),
+      district: data.district.trim(),
+      village: data.villageOrCity.trim(),
+      category: data.category,
+      urgency: data.urgency,
+    });
+
+  // Execute real server-side Google Gemini API analysis with 5-step processing indicator & client-side caching by request ID
+  const executeGeminiAnalysis = async (
+    data: CitizenRequestFormData,
+    requestIdToUse: string = draftRequestId
+  ): Promise<Record<string, unknown> | null> => {
+    const cleanText = data.text.trim();
+    if (!cleanText || cleanText.length < MIN_DESCRIPTION_CHARS) {
+      setGeminiState('error');
+      setGeminiErrorMsg(loc.errors.text);
+      return null;
+    }
+
+    const cacheKey = buildRequestCacheKey(data);
+
+    // 1. Check in-component state for matching requestId & content
+    if (
+      liveGeminiAnalysis &&
+      (liveGeminiAnalysis.requestId === requestIdToUse || liveGeminiAnalysis.cacheKey === cacheKey) &&
+      liveGeminiAnalysis.cacheKey === cacheKey
+    ) {
+      setGeminiState('analyzed');
+      setGeminiErrorMsg(null);
+      return liveGeminiAnalysis.data;
+    }
+
+    // 2. Check shared client-side cache by request ID first (prevents redundant API calls across view navigation)
+    const cachedById = getCachedAnalysisByRequestId(requestIdToUse);
+    if (cachedById && (!cachedById.contentKey || cachedById.contentKey === cacheKey)) {
+      setLiveGeminiAnalysis({
+        requestId: requestIdToUse,
+        cacheKey,
+        data: cachedById.raw,
+      });
+      setGeminiState('analyzed');
+      setGeminiErrorMsg(null);
+      return cachedById.raw;
+    }
+
+    // 3. Check shared client-side cache by content signature and bind to current requestId
+    const cachedByContent = getCachedAnalysisByContentKey(cacheKey);
+    if (cachedByContent) {
+      setCachedAnalysisByRequestId(
+        requestIdToUse,
+        cachedByContent.structured,
+        cachedByContent.raw,
+        cacheKey
+      );
+      setLiveGeminiAnalysis({
+        requestId: requestIdToUse,
+        cacheKey,
+        data: cachedByContent.raw,
+      });
+      setGeminiState('analyzed');
+      setGeminiErrorMsg(null);
+      return cachedByContent.raw;
+    }
+
+    setGeminiState('analyzing');
+    setGeminiErrorMsg(null);
+    setProcessingStepIdx(0);
+
+    const stepInterval = window.setInterval(() => {
+      setProcessingStepIdx((prev) => (prev < AI_PROCESSING_STEPS.length - 1 ? prev + 1 : prev));
+    }, 220);
+
+    try {
+      const response = await fetch('/api/ai/analyze-request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          requestId: requestIdToUse,
+          text: cleanText,
+          language: uiLanguage,
+          state: data.state.trim() || 'Maharashtra',
+          district: data.district.trim() || 'Pune District',
+          village: data.villageOrCity.trim() || 'Rural Block',
+          category: data.category || 'Healthcare',
+          urgency: data.urgency || 'High',
+        }),
+      });
+
+      window.clearInterval(stepInterval);
+      setProcessingStepIdx(AI_PROCESSING_STEPS.length - 1);
+
+      let resultJson: Record<string, unknown> = {};
+      try {
+        resultJson = (await response.json()) as Record<string, unknown>;
+      } catch {
+        setGeminiState('error');
+        setGeminiErrorMsg('AI analysis temporarily unavailable.');
+        return null;
+      }
+
+      if (!response.ok || !resultJson || resultJson.analyzedByGemini === false) {
+        setGeminiState('error');
+        setGeminiErrorMsg(
+          typeof resultJson?.error === 'string' && resultJson.error
+            ? resultJson.error
+            : 'AI analysis temporarily unavailable.'
+        );
+        return null;
+      }
+
+      const structuredForCache: GeminiStructuredAnalysis = {
+        language: String(resultJson.language || uiLanguage),
+        originalText: cleanText,
+        normalizedIssue: String(resultJson.normalizedIssue || cleanText),
+        category: String(resultJson.category || data.category || 'Healthcare'),
+        subcategory: String(resultJson.subcategory || 'General Infrastructure'),
+        location: String(resultJson.location || data.district || 'Pune District'),
+        urgency: String(resultJson.urgency || data.urgency || 'High'),
+        summary: String(resultJson.summary || cleanText),
+        infrastructureType: String(
+          resultJson.infrastructureType || resultJson.subcategory || 'Public Infrastructure'
+        ),
+        confidence: String(resultJson.confidence || '0.91'),
+        reasoning: String(resultJson.reasoning || ''),
+      };
+
+      // Cache result by requestId so navigating between views never re-triggers the API call
+      setCachedAnalysisByRequestId(requestIdToUse, structuredForCache, resultJson, cacheKey);
+      setLiveGeminiAnalysis({
+        requestId: requestIdToUse,
+        cacheKey,
+        data: resultJson,
+      });
+      setGeminiState('analyzed');
+      return resultJson;
+    } catch {
+      window.clearInterval(stepInterval);
+      setGeminiState('error');
+      setGeminiErrorMsg('AI analysis temporarily unavailable.');
+      return null;
+    }
+  };
+
+  const finalizeRequestSubmission = (
+    geminiData: Record<string, unknown> | null,
+    isAiAnalyzed: boolean
+  ) => {
+    const cleanState = formData.state.trim();
+    const cleanDistrict = formData.district.trim();
+    const cleanCategory = formData.category as InfrastructureCategory;
+    const cleanUrgency = formData.urgency as 'Critical' | 'High' | 'Medium' | 'Low';
+    const cleanLandmark = formData.landmark.trim();
+    const cleanText = formData.text.trim();
+    const cleanVillage =
+      formData.villageOrCity.trim() ||
+      `${cleanDistrict.replace(' District', '')} Community Ward`;
+
+    // Analytical Priority Model (Section 8: Existing analytics evaluate demand, population impact, infrastructure gap, investment context, and priority score)
+    const analytical = inferAnalysisFromInput(
+      cleanText,
+      uiLanguage,
+      cleanCategory,
+      cleanDistrict,
+      cleanVillage,
+      cleanUrgency
+    );
+
+    // Validate structured Gemini fields with safe fallbacks
+    const detectedLangRaw = String(geminiData?.language || geminiData?.detectedLanguage || uiLanguage);
+    const validDetectedLang: SupportedLanguage =
+      detectedLangRaw === 'Marathi' || detectedLangRaw === 'Hindi' || detectedLangRaw === 'English'
+        ? detectedLangRaw
+        : uiLanguage;
+
+    const geminiCategoryRaw = String(geminiData?.category || cleanCategory);
+    const resolvedCategory: InfrastructureCategory = INFRASTRUCTURE_CATEGORIES.includes(
+      geminiCategoryRaw as InfrastructureCategory
+    )
+      ? (geminiCategoryRaw as InfrastructureCategory)
+      : cleanCategory;
+
+    const geminiUrgencyRaw = String(geminiData?.urgency || cleanUrgency);
+    const resolvedUrgency: 'Critical' | 'High' | 'Medium' | 'Low' = (
+      ['Critical', 'High', 'Medium', 'Low'] as const
+    ).includes(geminiUrgencyRaw as 'Critical' | 'High' | 'Medium' | 'Low')
+      ? (geminiUrgencyRaw as 'Critical' | 'High' | 'Medium' | 'Low')
+      : cleanUrgency;
+
+    const normalizedIssue =
+      (isAiAnalyzed && typeof geminiData?.normalizedIssue === 'string' && geminiData.normalizedIssue.trim()) ||
+      (isAiAnalyzed && typeof geminiData?.extractedIssue === 'string' && geminiData.extractedIssue.trim()) ||
+      analytical.extracted;
+
+    const summaryText =
+      (isAiAnalyzed && typeof geminiData?.summary === 'string' && geminiData.summary.trim()) ||
+      (isAiAnalyzed && typeof geminiData?.translatedMeaning === 'string' && geminiData.translatedMeaning.trim()) ||
+      analytical.translated;
+
+    const subcategoryText =
+      (isAiAnalyzed && typeof geminiData?.subcategory === 'string' && geminiData.subcategory.trim()) ||
+      analytical.subcat;
+
+    const infrastructureTypeText =
+      (isAiAnalyzed &&
+        typeof geminiData?.infrastructureType === 'string' &&
+        geminiData.infrastructureType.trim()) ||
+      subcategoryText;
+
+    const locationText =
+      (isAiAnalyzed && typeof geminiData?.location === 'string' && geminiData.location.trim()) ||
+      cleanDistrict;
+
+    const confidenceText =
+      (isAiAnalyzed && typeof geminiData?.confidence === 'string' && geminiData.confidence.trim()) ||
+      (isAiAnalyzed ? '0.91' : 'N/A');
+
+    const reasoningText =
+      (isAiAnalyzed && typeof geminiData?.reasoning === 'string' && geminiData.reasoning.trim()) ||
+      (isAiAnalyzed
+        ? `Gemini classified this ${validDetectedLang} request under ${resolvedCategory} (${infrastructureTypeText}) and normalized the local development need for district prioritization.`
+        : 'AI analysis temporarily unavailable. Request routed via standard district intake rules.');
+
+    const structuredGeminiRecord: GeminiStructuredAnalysis | undefined = isAiAnalyzed
+      ? {
+          language: validDetectedLang,
+          originalText: cleanText,
+          normalizedIssue,
+          category: resolvedCategory,
+          subcategory: subcategoryText,
+          location: locationText,
+          urgency: resolvedUrgency,
+          summary: summaryText,
+          infrastructureType: infrastructureTypeText,
+          confidence: confidenceText,
+          reasoning: reasoningText,
+        }
+      : undefined;
+
+    const stateCode =
+      STATES_INTELLIGENCE.find((s) => s.name === cleanState)?.code || 'IN';
+    const numericSuffix = draftRequestId.split('-')[2] || String(Math.floor(10000 + Math.random() * 89999));
+    const finalizedRequestId = `REQ-${stateCode}-${numericSuffix}`;
+
+    const newRecord: CitizenRequestRecord = {
+      id: finalizedRequestId,
+      citizenText: cleanText,
+      detectedLanguage: validDetectedLang,
+      translatedMeaning: summaryText,
+      extractedIssue: normalizedIssue,
+      category: resolvedCategory,
+      subcategory: subcategoryText,
+      infrastructureType: infrastructureTypeText,
+      confidence: confidenceText,
+      aiReasoning: reasoningText,
+      analyzedByGemini: isAiAnalyzed,
+      geminiAnalysis: structuredGeminiRecord,
+      state: cleanState,
+      district: cleanDistrict,
+      villageOrCity: cleanVillage,
+      landmark: cleanLandmark,
+      urgency: resolvedUrgency,
+      sentiment:
+        resolvedUrgency === 'Critical' ? 'Distressed / Urgent' : 'Concerned / Constructive',
+      affectedPopulation: analytical.pop,
+      similarRequestsCount: analytical.simCount,
+      nearbyVillagesCount: 12,
+      recentSixMonthsPct: 36,
+      existingInfrastructureNearby: `Nearest verified ${resolvedCategory.toLowerCase()} facility is 18.5 km away (Ref: ${cleanLandmark})`,
+      priorityScore: analytical.priority,
+      assignedDepartment: analytical.dept,
+      assignedOfficer: `Nodal Officer, ${cleanDistrict}`,
+      status: 'Under Review',
+      submittedAt: 'Just now',
+      isOwnRequest: true,
+      aiSummary: isAiAnalyzed
+        ? `${summaryText} Clustered with ${analytical.simCount} similar community requests in ${cleanDistrict} (${cleanState}).`
+        : `Standard district routing in ${cleanDistrict} (${cleanState}) with ${analytical.simCount} community reports.`,
+      suggestedAction: `Deploy ${infrastructureTypeText} in ${cleanVillage}, ${cleanDistrict} (${cleanLandmark}) under priority sector allocation.`,
+      timeline: [
+        {
+          step: 'Submitted',
+          timestamp: 'Just now',
+          completed: true,
+          detail: `Submitted in ${validDetectedLang} from ${cleanVillage}, ${cleanDistrict} (${cleanLandmark})${
+            attachedFile ? ` · Attached: ${attachedFile}` : ''
+          }`,
+        },
+        {
+          step: 'AI Analysed',
+          timestamp: 'Just now',
+          completed: isAiAnalyzed,
+          detail: isAiAnalyzed
+            ? `Analyzed by Google Gemini · Classified under ${resolvedCategory} (${infrastructureTypeText}) · Confidence ${confidenceText}`
+            : 'AI analysis temporarily unavailable · Standard intake classification applied',
+        },
+        {
+          step: 'Department Assigned',
+          timestamp: 'Just now',
+          completed: true,
+          detail: `Routed to ${analytical.dept} (${cleanDistrict})`,
+        },
+        {
+          step: 'Under Review',
+          timestamp: 'Active Now',
+          completed: true,
+          detail: `Clustered with ${analytical.simCount} community reports across 12 nearby villages · Priority Score ${analytical.priority}/100`,
+        },
+        {
+          step: 'Action Initiated',
+          timestamp: 'Pending field inspection',
+          completed: false,
+          detail: `Queued for District Collectorate & ${analytical.dept} engineering verification`,
+        },
+        {
+          step: 'Resolved',
+          timestamp: 'Target SLA: 14–21 Days',
+          completed: false,
+          detail: 'Public completion verification & citizen sign-off',
+        },
+      ],
+    };
+
+    // Store the finalized analysis result in the client-side cache keyed by the finalized Request ID
+    if (isAiAnalyzed && structuredGeminiRecord) {
+      setCachedAnalysisByRequestId(
+        newRecord.id,
+        structuredGeminiRecord,
+        geminiData || { ...structuredGeminiRecord, analyzedByGemini: true },
+        buildRequestCacheKey(formData)
+      );
+    }
+
+    clearDraftFromStorage();
+    setIsDraftModified(false);
+    setWasRestoredFromDraft(false);
+    setDraftSavedAt(null);
+    onAddRequest(newRecord);
+    onSelectRequestForAnalysis(newRecord);
+    setJustSubmitted(newRecord);
+    setLastSubmittedRequestCache(newRecord);
+    setTrackedRequestId(newRecord.id);
+    setDraftRequestId(generateRequestIdForState(cleanState));
+    setAttachedFile(null);
+    setFilterLanguage('All');
+    setFilterCategory('All');
+    setFilterUrgency('All');
+    setFeedScope('my');
+    setIsFormOpen(false);
+    if (citizenTab === 'submit') {
+      setCitizenTab('all');
+    }
+  };
+
   // Validates all fields (state, district, category, urgency, landmark, text),
-  // updates the global app state via onAddRequest, clears persisted draft, and closes the form gracefully
-  const handleAddRequest = (e: React.FormEvent) => {
+  // calls Google Gemini API on the server, updates global app state via onAddRequest, and closes the form gracefully
+  const handleAddRequest = async (e: React.FormEvent) => {
     e.preventDefault();
 
     // 1. Run client-side validation for all required fields before submission
@@ -1206,117 +1643,15 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
     setFormErrors({});
     setTouchedFields({});
 
-    // 2. Extract validated values from local component state
-    const cleanState = formData.state.trim();
-    const cleanDistrict = formData.district.trim();
-    const cleanCategory = formData.category as InfrastructureCategory;
-    const cleanUrgency = formData.urgency as 'Critical' | 'High' | 'Medium' | 'Low';
-    const cleanLandmark = formData.landmark.trim();
-    const cleanText = formData.text.trim();
-    const cleanVillage =
-      formData.villageOrCity.trim() ||
-      `${cleanDistrict.replace(' District', '')} Community Ward`;
-
-    const analysis = inferAnalysisFromInput(
-      cleanText,
-      uiLanguage,
-      cleanCategory,
-      cleanDistrict,
-      cleanVillage,
-      cleanUrgency
-    );
-
-    const stateCode =
-      STATES_INTELLIGENCE.find((s) => s.name === cleanState)?.code || 'IN';
-    const randomId = Math.floor(10000 + Math.random() * 89999);
-
-    const newRecord: CitizenRequestRecord = {
-      id: `REQ-${stateCode}-${randomId}`,
-      citizenText: cleanText,
-      detectedLanguage: uiLanguage,
-      translatedMeaning: analysis.translated,
-      extractedIssue: analysis.extracted,
-      category: cleanCategory,
-      subcategory: analysis.subcat,
-      state: cleanState,
-      district: cleanDistrict,
-      villageOrCity: cleanVillage,
-      landmark: cleanLandmark,
-      urgency: cleanUrgency,
-      sentiment:
-        cleanUrgency === 'Critical' ? 'Distressed / Urgent' : 'Concerned / Constructive',
-      affectedPopulation: analysis.pop,
-      similarRequestsCount: analysis.simCount,
-      nearbyVillagesCount: 12,
-      recentSixMonthsPct: 36,
-      existingInfrastructureNearby: `Nearest verified ${cleanCategory.toLowerCase()} facility is 18.5 km away (Ref: ${cleanLandmark})`,
-      priorityScore: analysis.priority,
-      assignedDepartment: analysis.dept,
-      assignedOfficer: `Nodal Officer, ${cleanDistrict}`,
-      status: 'Under Review',
-      submittedAt: 'Just now',
-      isOwnRequest: true,
-      aiSummary: `Multilingual NLP clustered this ${uiLanguage} submission with ${analysis.simCount} similar community requests in ${cleanDistrict} (${cleanState}).`,
-      suggestedAction: `Deploy ${analysis.subcat} in ${cleanVillage}, ${cleanDistrict} (${cleanLandmark}) under priority sector allocation.`,
-      timeline: [
-        {
-          step: 'Submitted',
-          timestamp: 'Just now',
-          completed: true,
-          detail: `Submitted in ${uiLanguage} from ${cleanVillage}, ${cleanDistrict} (${cleanLandmark})${
-            attachedFile ? ` · Attached: ${attachedFile}` : ''
-          }`,
-        },
-        {
-          step: 'AI Analysed',
-          timestamp: 'Just now',
-          completed: true,
-          detail: `Classified under ${cleanCategory} (${analysis.subcat}) · ${cleanUrgency} Urgency`,
-        },
-        {
-          step: 'Department Assigned',
-          timestamp: 'Just now',
-          completed: true,
-          detail: `Routed to ${analysis.dept} (${cleanDistrict})`,
-        },
-        {
-          step: 'Under Review',
-          timestamp: 'Active Now',
-          completed: true,
-          detail: `Clustered with ${analysis.simCount} community reports across 12 nearby villages`,
-        },
-        {
-          step: 'Action Initiated',
-          timestamp: 'Pending field inspection',
-          completed: false,
-          detail: `Queued for District Collectorate & ${analysis.dept} engineering verification`,
-        },
-        {
-          step: 'Resolved',
-          timestamp: 'Target SLA: 14–21 Days',
-          completed: false,
-          detail: 'Public completion verification & citizen sign-off',
-        },
-      ],
-    };
-
-    // 3. Clear persisted draft, update global app state via onAddRequest, and close the form gracefully
-    clearDraftFromStorage();
-    setIsDraftModified(false);
-    setWasRestoredFromDraft(false);
-    setDraftSavedAt(null);
-    onAddRequest(newRecord);
-    setJustSubmitted(newRecord);
-    setTrackedRequestId(newRecord.id);
-    setAttachedFile(null);
-    setFilterLanguage('All');
-    setFilterCategory('All');
-    setFilterUrgency('All');
-    setFeedScope('my');
-    setIsFormOpen(false);
-    if (citizenTab === 'submit') {
-      setCitizenTab('all');
+    // 2. Call real server-side Google Gemini API to analyze the citizen's text request
+    const geminiOutput = await executeGeminiAnalysis(formData);
+    if (!geminiOutput) {
+      // Do not silently pretend that the request was analyzed by AI (Section 3)
+      return;
     }
+
+    // 3. Finalize and connect Gemini output to the existing pipeline
+    finalizeRequestSubmission(geminiOutput, true);
   };
 
   // Separate Citizen's Own Requests vs Community Requests
@@ -1450,7 +1785,7 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
               { id: 'my-requests', label: `${loc.tabs.myRequests} (${myOwnRequests.length})` },
               {
                 id: 'community',
-                label: `${loc.tabs.community} (${requests.length + COLLECTIVE_CLUSTERS.length})`,
+                label: `${loc.tabs.community} (${requests.length + clusters.length})`,
               },
               { id: 'status', label: loc.tabs.status },
             ].map((tab) => (
@@ -1721,7 +2056,7 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
                 <div className="flex items-center gap-2">
                   <Users className="w-5 h-5 text-blue-600" />
                   <h2 className="text-lg font-bold text-slate-900">
-                    {loc.communityHeaderTitle} ({COLLECTIVE_CLUSTERS.length})
+                    {loc.communityHeaderTitle} ({clusters.length})
                   </h2>
                 </div>
                 <p className="text-xs text-slate-500 mt-0.5">{loc.citizenHeaderSub}</p>
@@ -1739,7 +2074,7 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 text-xs">
-              {COLLECTIVE_CLUSTERS.map((cluster) => {
+              {clusters.map((cluster) => {
                 const isEndorsed = Boolean(endorsedClusters[cluster.id]);
                 const totalReports = cluster.citizenReports + (isEndorsed ? 1 : 0);
                 return (
@@ -2690,28 +3025,209 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
                   </div>
                 </div>
 
-                {/* Primary Submit Button */}
+                {/* Primary Submit & Gemini Analysis Button */}
                 <button
                   type="submit"
-                  className="w-full py-3.5 px-5 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl shadow-sm transition-colors flex items-center justify-center gap-2 text-sm cursor-pointer"
+                  disabled={geminiState === 'analyzing'}
+                  className="w-full py-3.5 px-5 bg-blue-600 hover:bg-blue-500 disabled:bg-blue-700 text-white font-bold rounded-xl shadow-sm transition-colors flex items-center justify-center gap-2 text-sm cursor-pointer"
                 >
-                  <Send className="w-4 h-4" />
-                  <span>{t.btnSubmit}</span>
+                  {geminiState === 'analyzing' ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Analyzing with Gemini AI...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-4 h-4" />
+                      <span>{t.btnSubmit}</span>
+                    </>
+                  )}
                 </button>
               </form>
 
-              {/* Friendly Live AI Summary Preview inside Form Card */}
-              <div className="p-4 rounded-xl bg-slate-900 text-white border border-slate-800 space-y-2 text-xs">
-                <div className="flex items-center justify-between text-[11px] font-semibold text-teal-400">
-                  <span>{loc.liveAiPreviewBadge}</span>
-                  <span>
-                    {CATEGORY_ICONS[activeCategory]}{' '}
-                    {getLocalizedCategoryLabel(activeCategory).split(' (')[0]}
-                  </span>
+              {/* AI Processing Sequence State (Section 5 & Section 12) */}
+              {geminiState === 'analyzing' && (
+                <div
+                  data-testid="gemini-processing-state"
+                  className="p-4 rounded-xl bg-slate-950 text-white border border-blue-500/40 space-y-3 text-xs"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 font-semibold text-teal-400">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-teal-400" />
+                      <span>Analyzing with Gemini AI...</span>
+                    </div>
+                    <span className="font-mono text-[10px] text-slate-400">
+                      Step {processingStepIdx + 1} / {AI_PROCESSING_STEPS.length}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-5 gap-1.5">
+                    {AI_PROCESSING_STEPS.map((stepLabel, idx) => {
+                      const isDone = idx < processingStepIdx;
+                      const isCurrent = idx === processingStepIdx;
+                      return (
+                        <div
+                          key={stepLabel}
+                          className={`p-2 rounded-lg border text-[11px] flex items-center gap-1.5 transition-all ${
+                            isCurrent
+                              ? 'bg-blue-950/90 border-blue-400 text-white font-semibold'
+                              : isDone
+                              ? 'bg-emerald-950/60 border-emerald-700/60 text-emerald-300'
+                              : 'bg-slate-900 border-slate-800 text-slate-500'
+                          }`}
+                        >
+                          {isDone ? (
+                            <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                          ) : isCurrent ? (
+                            <Loader2 className="w-3 h-3 animate-spin text-blue-400 shrink-0" />
+                          ) : (
+                            <Clock className="w-3 h-3 text-slate-600 shrink-0" />
+                          )}
+                          <span className="truncate">{stepLabel}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-                <div className="text-slate-200 leading-snug">
-                  “{formData.text.trim() ? livePreviewAnalysis.translated : t.requestPlaceholder}”
+              )}
+
+              {/* Professional Fallback Error State if Gemini Request Fails (Section 3 & Section 13) */}
+              {geminiState === 'error' && (
+                <div
+                  role="alert"
+                  data-testid="gemini-error-state"
+                  className="p-4 rounded-xl bg-red-950 text-red-100 border border-red-700 space-y-3 text-xs"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2 font-bold text-red-300 text-sm">
+                      <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                      <span>{geminiErrorMsg || 'AI analysis temporarily unavailable.'}</span>
+                    </div>
+                  </div>
+                  <p className="text-red-200/90 text-[11px] leading-relaxed">
+                    The Google Gemini analysis service could not complete this request right now. You can retry Gemini AI analysis or register your request using standard district routing without AI analysis.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => executeGeminiAnalysis(formData)}
+                      className="px-3 py-1.5 rounded-lg bg-white hover:bg-red-50 text-red-950 font-bold cursor-pointer transition-colors"
+                    >
+                      Retry Gemini AI Analysis
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => finalizeRequestSubmission(null, false)}
+                      className="px-3 py-1.5 rounded-lg bg-red-900 hover:bg-red-800 text-red-100 border border-red-700 font-semibold cursor-pointer transition-colors"
+                    >
+                      Submit with Standard Routing (No AI)
+                    </button>
+                  </div>
                 </div>
+              )}
+
+              {/* Friendly Live AI Summary Preview & On-Demand Gemini Analysis inside Form Card */}
+              <div className="p-4 rounded-xl bg-slate-900 text-white border border-slate-800 space-y-3 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-semibold text-teal-400">
+                  <div className="flex items-center gap-2">
+                    <span>{loc.liveAiPreviewBadge}</span>
+                    {geminiState === 'analyzed' &&
+                      liveGeminiAnalysis?.cacheKey === buildRequestCacheKey(formData) && (
+                        <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-700/70 font-mono text-[10px]">
+                          ✓ Analyzed by Google Gemini
+                        </span>
+                      )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span>
+                      {CATEGORY_ICONS[activeCategory]}{' '}
+                      {getLocalizedCategoryLabel(activeCategory).split(' (')[0]}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={geminiState === 'analyzing' || !isTextValidLength}
+                      onClick={() => executeGeminiAnalysis(formData)}
+                      className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                    >
+                      <Sparkles className="w-3 h-3" />
+                      <span>
+                        {geminiState === 'analyzing'
+                          ? 'Analyzing with Gemini AI...'
+                          : 'Analyze with Gemini AI'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {geminiState === 'analyzed' &&
+                liveGeminiAnalysis?.cacheKey === buildRequestCacheKey(formData) ? (
+                  <div className="space-y-2.5 pt-1 border-t border-slate-800">
+                    {/* Multilingual Flow: Original Language -> AI Interpretation -> Standardized Development Need */}
+                    <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 flex flex-wrap items-center gap-2 text-[11px]">
+                      <span className="text-slate-400">
+                        Detected Language:{' '}
+                        <strong className="text-white">
+                          {String(liveGeminiAnalysis.data.language || uiLanguage)}
+                        </strong>
+                      </span>
+                      <span className="text-slate-600">→</span>
+                      <span className="text-teal-300">
+                        Normalized Meaning:{' '}
+                        <strong className="text-white">
+                          {String(liveGeminiAnalysis.data.normalizedIssue || livePreviewAnalysis.extracted)}
+                        </strong>
+                      </span>
+                      <span className="text-slate-600">→</span>
+                      <span className="text-blue-300">
+                        Category:{' '}
+                        <strong className="text-white">
+                          {String(liveGeminiAnalysis.data.category || activeCategory)}
+                        </strong>
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px]">
+                      <div className="p-2 rounded bg-slate-950 border border-slate-800">
+                        <div className="text-slate-400">Infrastructure Type</div>
+                        <div className="font-semibold text-white mt-0.5">
+                          {String(
+                            liveGeminiAnalysis.data.infrastructureType ||
+                              liveGeminiAnalysis.data.subcategory ||
+                              livePreviewAnalysis.subcat
+                          )}
+                        </div>
+                      </div>
+                      <div className="p-2 rounded bg-slate-950 border border-slate-800">
+                        <div className="text-slate-400">Location & Urgency</div>
+                        <div className="font-semibold text-white mt-0.5">
+                          {String(liveGeminiAnalysis.data.location || formData.district)} ·{' '}
+                          <span className="text-amber-300">
+                            {String(liveGeminiAnalysis.data.urgency || activeUrgency)}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="p-2 rounded bg-slate-950 border border-slate-800">
+                        <div className="text-slate-400">Confidence</div>
+                        <div className="font-mono font-bold text-emerald-400 mt-0.5">
+                          {String(liveGeminiAnalysis.data.confidence || '0.91')}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="text-slate-200 leading-snug text-[11px]">
+                      <span className="text-slate-400 font-semibold">Summary: </span>
+                      {String(liveGeminiAnalysis.data.summary || livePreviewAnalysis.translated)}
+                    </div>
+                    <div className="text-slate-300 leading-snug text-[11px]">
+                      <span className="text-teal-400 font-semibold">AI Explanation: </span>
+                      {String(liveGeminiAnalysis.data.reasoning || '')}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-slate-200 leading-snug">
+                    “{formData.text.trim() ? livePreviewAnalysis.translated : t.requestPlaceholder}”
+                  </div>
+                )}
+
                 <div className="text-[11px] text-slate-400 flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-slate-800">
                   <span>
                     {loc.liveAiTargetLabel}{' '}
@@ -2734,8 +3250,19 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
                   <div className="flex items-center gap-2.5">
                     <CheckCircle2 className="w-6 h-6 text-emerald-400 shrink-0" />
                     <div>
-                      <div className="text-xs font-mono font-bold text-emerald-300">
-                        {justSubmitted.id} · {loc.successBannerBadge}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-mono font-bold text-emerald-300">
+                          {justSubmitted.id} · {loc.successBannerBadge}
+                        </span>
+                        {justSubmitted.analyzedByGemini ? (
+                          <span className="px-2 py-0.5 rounded bg-emerald-800/90 text-emerald-200 border border-emerald-600 font-mono text-[10px] font-semibold">
+                            ✓ Analyzed by Google Gemini
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded bg-amber-900/80 text-amber-200 border border-amber-700 font-mono text-[10px]">
+                            AI analysis temporarily unavailable
+                          </span>
+                        )}
                       </div>
                       <h3 className="text-base font-bold mt-0.5">
                         {loc.successCitizenTitle(
@@ -2755,6 +3282,28 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
                   </button>
                 </div>
 
+                {/* Multilingual Normalization Flow: Original Language -> AI Interpretation -> Standardized Development Need */}
+                <div className="p-3 rounded-xl bg-emerald-900/40 border border-emerald-800/90 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 font-mono text-[11px]">
+                      Detected Language: {justSubmitted.detectedLanguage}
+                    </span>
+                    <span className="text-emerald-400">→</span>
+                    <span className="text-white font-medium">
+                      Normalized Meaning: “{justSubmitted.extractedIssue}”
+                    </span>
+                    <span className="text-emerald-400">→</span>
+                    <span className="px-2 py-0.5 rounded bg-teal-900 text-teal-200 font-semibold text-[11px]">
+                      Category: {justSubmitted.category} ({justSubmitted.infrastructureType || justSubmitted.subcategory})
+                    </span>
+                  </div>
+                  {justSubmitted.confidence && justSubmitted.analyzedByGemini && (
+                    <span className="font-mono text-[11px] text-emerald-300">
+                      Confidence: <strong className="text-white">{justSubmitted.confidence}</strong>
+                    </span>
+                  )}
+                </div>
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                   <div className="p-3.5 rounded-xl bg-emerald-900/50 border border-emerald-800">
                     <div className="text-emerald-300 font-semibold">
@@ -2765,12 +3314,80 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
                     </p>
                   </div>
                   <div className="p-3.5 rounded-xl bg-emerald-900/50 border border-emerald-800">
-                    <div className="text-teal-300 font-semibold">{loc.successNormalizedLabel}</div>
+                    <div className="text-teal-300 font-semibold">
+                      {loc.successNormalizedLabel}
+                    </div>
                     <p className="text-emerald-100 mt-1 leading-relaxed">
                       “{justSubmitted.translatedMeaning}”
                     </p>
                   </div>
                 </div>
+
+                {/* Structured Gemini Output Details Grid (Section 2 & Section 7) */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+                  <div className="p-2.5 rounded-lg bg-emerald-900/40 border border-emerald-800/80">
+                    <div className="text-[10px] text-emerald-300 uppercase">Category</div>
+                    <div className="font-bold text-white mt-0.5">{justSubmitted.category}</div>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-emerald-900/40 border border-emerald-800/80">
+                    <div className="text-[10px] text-emerald-300 uppercase">Infrastructure Type</div>
+                    <div className="font-bold text-white mt-0.5">
+                      {justSubmitted.infrastructureType || justSubmitted.subcategory}
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-emerald-900/40 border border-emerald-800/80">
+                    <div className="text-[10px] text-emerald-300 uppercase">Location & Urgency</div>
+                    <div className="font-bold text-white mt-0.5">
+                      {justSubmitted.district} · {justSubmitted.urgency}
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-emerald-900/40 border border-emerald-800/80">
+                    <div className="text-[10px] text-emerald-300 uppercase">
+                      Analytical Priority Score
+                    </div>
+                    <div className="font-mono font-bold text-teal-300 mt-0.5">
+                      {justSubmitted.priorityScore} / 100
+                    </div>
+                  </div>
+                </div>
+
+                {justSubmitted.aiReasoning && (
+                  <div className="p-3 rounded-xl bg-emerald-900/30 border border-emerald-800/70 text-xs text-emerald-100 leading-relaxed">
+                    <strong className="text-teal-300">AI Explanation & Reasoning: </strong>
+                    {justSubmitted.aiReasoning}
+                  </div>
+                )}
+
+                {/* Connected End-to-End Pipeline Navigation Strip (Section 4 & Section 11) */}
+                {!isCitizen && (
+                  <div className="p-3 rounded-xl bg-emerald-950/90 border border-emerald-800 space-y-2 text-xs">
+                    <div className="text-[11px] font-semibold text-emerald-300">
+                      End-to-End Pipeline Connected — Follow This Request Across Modules:
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {[
+                        { id: 'ai-insights' as NavModule, label: '1. AI Insights & Cluster' },
+                        { id: 'demand-hotspots' as NavModule, label: '2. Demand Hotspot' },
+                        { id: 'infrastructure-gaps' as NavModule, label: '3. Gap & Priority Score' },
+                        { id: 'recommendations' as NavModule, label: '4. Recommended Project' },
+                        { id: 'impact-simulator' as NavModule, label: '5. Impact Simulator' },
+                        { id: 'department-actions' as NavModule, label: '6. Department Action' },
+                      ].map((step) => (
+                        <button
+                          key={step.id}
+                          type="button"
+                          onClick={() => {
+                            onSelectRequestForAnalysis(justSubmitted);
+                            onNavigate(step.id);
+                          }}
+                          className="px-2.5 py-1 rounded-md bg-emerald-900 hover:bg-emerald-800 text-emerald-100 border border-emerald-700 text-[11px] font-medium cursor-pointer transition-colors"
+                        >
+                          {step.label} →
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-1 text-xs">
                   <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-emerald-200">
@@ -3015,12 +3632,36 @@ export const CitizenRequestsView: React.FC<CitizenRequestsViewProps> = ({
                         </div>
 
                         <div className="p-3 rounded-lg bg-white border border-slate-200">
-                          <div className="text-[11px] font-semibold text-blue-700 mb-1">
-                            {loc.cardSummaryLabel}
+                          <div className="flex items-center justify-between gap-2 text-[11px] font-semibold text-blue-700 mb-1">
+                            <span>{loc.cardSummaryLabel}</span>
+                            {req.analyzedByGemini && (
+                              <span className="text-[10px] font-mono text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200">
+                                Analyzed by Google Gemini
+                              </span>
+                            )}
                           </div>
                           <p className="text-slate-700 leading-relaxed">
                             “{req.translatedMeaning}”
                           </p>
+                          {(req.infrastructureType || req.confidence) && (
+                            <div className="mt-1.5 pt-1.5 border-t border-slate-100 flex flex-wrap items-center gap-3 text-[11px] text-slate-500">
+                              <span>
+                                Normalized Issue:{' '}
+                                <strong className="text-slate-800">{req.extractedIssue}</strong>
+                              </span>
+                              {req.infrastructureType && (
+                                <span>
+                                  Infrastructure:{' '}
+                                  <strong className="text-slate-800">{req.infrastructureType}</strong>
+                                </span>
+                              )}
+                              {req.confidence && (
+                                <span className="font-mono">
+                                  Confidence: <strong className="text-emerald-700">{req.confidence}</strong>
+                                </span>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </div>
 
